@@ -53,8 +53,8 @@
  * high_temp - fan will increase speed when higher than this temperature
  * max_temp - fan will run at full speed above this temperature */
 int low_temp = 63;   // try ranges 55-63
-int high_temp = 66;  // try ranges 58-66
-int max_temp = 86;   // do not set it > 90
+int high_temp = 70;  // try ranges 58-66
+int max_temp = 88;   // do not set it > 90
 
 // maximum number of processors etc supported
 #define NUM_PROCESSORS 6
@@ -62,8 +62,8 @@ int max_temp = 86;   // do not set it > 90
 #define NUM_TEMP_INPUTS 64
 #define NUM_FANS 10
 // sane defaults when user provides unexpected values
-#define MIN_FAN_SPEED_DEFAULT 500
-#define MAX_FAN_SPEED_DEFAULT 6500
+#define MIN_FAN_SPEED_DEFAULT 2000
+#define MAX_FAN_SPEED_DEFAULT 7600
 
 int polling_interval = 1;
 
@@ -525,10 +525,24 @@ void retrieve_settings(const char* settings_path, t_fans* fans)
     }
 }
 
+int calc_target_speed(int temp, int minspeed, int maxspeed, int templow, int temphigh, int tempmax)
+{
+	if (temp < templow) {
+		return minspeed;
+	} else if (temp > tempmax) {
+		return maxspeed;
+	} else {
+		const double normalized_scale = 1.0 * (temp - templow) / (tempmax - templow);
+		return round(minspeed + normalized_scale * (maxspeed - minspeed));
+	}
+}
+
 void mbpfan()
 {
-    int old_temp, new_temp, fan_speed, steps;
+    int old_temp, new_temp, fan_speed, steps, target_speed, speed_diff;
     int temp_change;
+    //struct io_uring ring;
+    //io_uring_queue_init(ENTRIES, &ring, 0);
     
     sensors = retrieve_sensors();
     fans = retrieve_fans();
@@ -557,7 +571,8 @@ void mbpfan()
 
     fan = fans;
     while(fan != NULL) {
-
+        target_speed = calc_target_speed(new_temp, fan->fan_min_speed, fan->fan_max_speed, low_temp, high_temp, max_temp);
+        set_fan_speed(fan, target_speed);
        fan->step_up = (float)( fan->fan_max_speed - fan->fan_min_speed ) /
                       (float)( ( max_temp - high_temp ) * ( max_temp - high_temp + 1 ) / 2.0 );
 
@@ -567,42 +582,45 @@ void mbpfan()
     }
 
 recalibrate:
-    if(verbose) {
-        mbp_log(LOG_INFO, "Sleeping for 2 seconds to get first temp delta");
-    }
-    sleep(2);
-
     while(1) {
         old_temp = new_temp;
         new_temp = get_temp(sensors);
-
         fan = fans;
 
 	while(fan != NULL) {
 	    fan_speed = fan->old_speed;
+	    target_speed = calc_target_speed(new_temp, fan->fan_min_speed, fan->fan_max_speed, low_temp, high_temp, max_temp);
+        speed_diff = target_speed - fan_speed;
 
-	    if(new_temp >= max_temp && fan->old_speed != fan->fan_max_speed) {
-                fan_speed = fan->fan_max_speed;
-            }
-
-            if(new_temp <= low_temp && fan_speed != fan->fan_min_speed) {
-                fan_speed = fan->fan_min_speed;
-            }
-
+	    if(new_temp >= max_temp) {
+            fan_speed = fan->fan_max_speed;
+		    target_speed = fan_speed;
+        } else if(new_temp <= low_temp) {
+            fan_speed = fan->fan_min_speed;
+	    	target_speed = fan_speed;
+        } else {
+	        //if (abs(speed_diff) < 250) continue;
+            fan_speed += round(speed_diff * 0.1);//log(abs(speed_diff)));
+		    if (fan_speed < fan->fan_min_speed) fan_speed = fan->fan_min_speed;
+		    else if (fan_speed > fan->fan_max_speed) fan_speed = fan->fan_max_speed;
+	    }
+		/*
             temp_change = new_temp - old_temp;
 
             if(temp_change > 0 && new_temp > high_temp && new_temp < max_temp) {
                 steps = ( new_temp - high_temp ) * ( new_temp - high_temp + 1 ) / 2;
-                fan_speed = max( fan_speed, ceil(fan->fan_min_speed + steps * fan->step_up) );
+                target_speed = max( fan_speed, ceil(fan->fan_min_speed + steps * fan->step_up) );
+                fan_speed += (target_speed - fan_speed) * 0.25f;
             }
 
             if(temp_change < 0 && new_temp > low_temp && new_temp < max_temp) {
                 steps = ( max_temp - new_temp ) * ( max_temp - new_temp + 1 ) / 2;
-                fan_speed = min( fan_speed, floor(fan->fan_max_speed - steps * fan->step_down) );
+                target_speed = min( fan_speed, floor(fan->fan_max_speed - steps * fan->step_down) );
+                fan_speed += (target_speed - fan_speed) * 0.25f;
             }
-
+*/
             if(verbose) {
-                mbp_log(LOG_INFO, "Old Temp: %d New Temp: %d Fan: %s Speed: %d", old_temp, new_temp, fan->label, fan_speed);
+                mbp_log(LOG_INFO, "Old Temp: %d New Temp: %d Fan: %s Target: %d Speed: %d", old_temp, new_temp, fan->label, target_speed, fan_speed);
 	    }
 
 	    set_fan_speed(fan, fan_speed);
@@ -610,7 +628,7 @@ recalibrate:
 	} 
 
         if(verbose) {
-            mbp_log(LOG_INFO, "Sleeping for %d seconds", polling_interval);
+     //       mbp_log(LOG_INFO, "Sleeping for %d seconds", polling_interval);
         }
    
         time_t before_sleep = time(NULL);
@@ -618,9 +636,10 @@ recalibrate:
         // call nanosleep instead of sleep to avoid rt_sigprocmask and
         // rt_sigaction
         struct timespec ts;
-        ts.tv_sec = polling_interval;
-        ts.tv_nsec = 0;
-        nanosleep(&ts, NULL);
+        ts.tv_sec = 2;
+        ts.tv_nsec = 0;//100 * 1000 * 1000; // 100 ms
+        clock_nanosleep(CLOCK_REALTIME, 0, &ts, NULL);
+
 
         time_t after_sleep = time(NULL);
         if(after_sleep - before_sleep > 2 * polling_interval) {
